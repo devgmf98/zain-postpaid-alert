@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+logs/
+.DS_Store
+
+# Scratch debugging scripts
+tmp_*.js

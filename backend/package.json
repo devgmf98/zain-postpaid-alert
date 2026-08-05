@@ -1,0 +1,26 @@
+{
+  "name": "zain-data-pool-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Polls Oracle CDRs every second for a data-pooling account and sends 50% / 100% usage SMS alerts via the Floodwave gateway, de-duplicated per MSISDN per month in MySQL.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "logs": "powershell -NoProfile -Command \"Get-Content (Get-ChildItem logs/monitor-*.log | Select-Object -Last 1).FullName -Wait -Tail 40\"",
+    "service": "node scripts/supervisor.js",
+    "install-autostart": "powershell -ExecutionPolicy Bypass -File scripts/install-autostart.ps1",
+    "uninstall-autostart": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-autostart.ps1",
+    "check": "node scripts/check.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mysql2": "^3.11.3",
+    "oracledb": "^6.6.0",
+    "ws": "^8.21.1"
+  }
+}

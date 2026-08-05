@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Secrets - .env holds live Oracle and Floodwave credentials.
+# .env.example is the committed template and carries placeholders only.
+.env
+.env.local
+*.env.backup
+
+# Runtime output
+logs/
+*.log
+supervisor.pid
+
+# OS
+.DS_Store
+Thumbs.db

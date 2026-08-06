@@ -85,8 +85,16 @@ async function loadCycleStarts(walletId, periodYm, topThresholdPercent, capGb) {
  */
 async function loadPeriodState(walletId, periodYm, rounds = new Map()) {
   const rows = await mysqlDb.query(
-    `SELECT msisdn, threshold_percent, status, attempts, retryable, updated_at, round_no,
-            period_bytes_used
+    `SELECT msisdn, threshold_percent, status, attempts, retryable, round_no,
+            period_bytes_used,
+            -- Age computed inside MySQL, against MySQL's own NOW(). Returning
+            -- updated_at and subtracting it from Date.now() compared two
+            -- different clocks: on a host where MySQL runs UTC and the process
+            -- runs Africa/Juba that inflated every age by two hours, so the
+            -- retry cooldown was always satisfied and a failing alert re-fired
+            -- every second until its budget was gone. Both sides of this
+            -- subtraction come from the same clock, so any skew cancels.
+            TIMESTAMPDIFF(SECOND, updated_at, NOW()) AS age_seconds
        FROM \`${T}\`
       WHERE period_ym = ? AND wallet_id = ?`,
     [periodYm, String(walletId)]
@@ -102,7 +110,8 @@ async function loadPeriodState(walletId, periodYm, rounds = new Map()) {
       status: row.status,
       attempts: Number(row.attempts),
       retryable: row.retryable === undefined ? true : Boolean(row.retryable),
-      updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : 0,
+      // How long since this row last changed, in milliseconds.
+      ageMs: Math.max(0, Number(row.age_seconds || 0)) * 1000,
       // Total usage when this alert went out. A higher threshold must not fire
       // off the same reading - it has to be genuinely reached.
       periodBytesAtSend: Number(row.period_bytes_used || 0),

@@ -106,7 +106,7 @@ function statsFor(walletId) {
  * it the whole retry budget would be spent within a few seconds of a gateway
  * blip and the alert lost for the rest of the month.
  */
-function needsSend(periodState, msisdn, level, now = Date.now()) {
+function needsSend(periodState, msisdn, level) {
   const existing = periodState.get(notificationRepo.key(msisdn, level.percent));
   if (!existing) return true;
   // SKIPPED means the bar was already behind the subscriber when we first saw
@@ -123,7 +123,12 @@ function needsSend(periodState, msisdn, level, now = Date.now()) {
   // PENDING means claimed and handed to the delivery queue; FAILED means an
   // attempt finished badly. In both cases wait out the cooldown - without it a
   // one-second poll would re-claim an in-flight job on every tick.
-  return now - existing.updatedAt >= config.sms.retryCooldownMs;
+  //
+  // ageMs is measured by MySQL against its own clock, not by subtracting a
+  // stored timestamp from this process's clock. The two hosts do not always
+  // agree on the time, and when they do not that subtraction silently makes
+  // every row look old enough to retry.
+  return existing.ageMs >= config.sms.retryCooldownMs;
 }
 
 /**
@@ -212,7 +217,7 @@ async function deliverAlert(offer, row, level, periodYm, periodState) {
   periodState.set(notificationRepo.key(row.msisdn, level.percent), {
     status: 'PENDING',
     attempts: 1,
-    updatedAt: Date.now(),
+    ageMs: 0,
   });
   stats.lastAlertAt = new Date().toISOString();
 }
@@ -278,7 +283,7 @@ async function closePassedThresholds(offer, usageRows, alreadySeen, window, peri
                 status: 'SKIPPED',
                 attempts: 0,
                 retryable: false,
-                updatedAt: Date.now(),
+                ageMs: 0,
                 periodBytesAtSend: row.periodBytesUsed || row.bytesUsed,
               });
             }

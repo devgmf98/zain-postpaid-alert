@@ -33,8 +33,12 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.notifications}\` (
   retryable         TINYINT(1)      NOT NULL DEFAULT 1 COMMENT 'last failure was transient (5xx/timeout), not a bad request',
   gateway_response  TEXT            NULL,
   error_message     TEXT            NULL,
-  created_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  -- DATETIME, not TIMESTAMP, so these read back exactly as written - the same
+  -- storage as sent_at beside them. TIMESTAMP is held as UTC and converted on
+  -- read using whatever the session zone happens to be, which made these two
+  -- columns disagree with sent_at in the same row.
+  created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   sent_at           DATETIME        NULL,
   PRIMARY KEY (id),
   -- Scoped to the pool. The cap is an allowance of the account+wallet, so a
@@ -80,7 +84,7 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.status}\` (
   last_error_at     DATETIME        NULL,
   consecutive_errors INT UNSIGNED   NOT NULL DEFAULT 0,
   started_at        DATETIME        NULL,
-  updated_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_service (service_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -108,8 +112,8 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.usage}\` (
   period_bytes_used BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'cumulative usage this period, across all rounds',
   window_from       DATETIME        NULL,
   window_to         DATETIME        NULL,
-  first_seen_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  first_seen_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_pool_msisdn_period (account_code, wallet_id, msisdn, period_ym),
   KEY idx_period (period_ym),
@@ -139,8 +143,12 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.offers}\` (
   threshold_50_gb   DECIMAL(10,3)   NOT NULL,
   threshold_100_gb  DECIMAL(10,3)   NOT NULL,
   active            TINYINT(1)      NOT NULL DEFAULT 1 COMMENT 'inactive offers are skipped by the poller',
-  created_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  -- DATETIME, not TIMESTAMP, so these read back exactly as written - the same
+  -- storage as sent_at beside them. TIMESTAMP is held as UTC and converted on
+  -- read using whatever the session zone happens to be, which made these two
+  -- columns disagree with sent_at in the same row.
+  created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   -- One offer per wallet. A second row for the same wallet would double every
   -- alert for its subscribers, so this is enforced rather than merely expected.
@@ -175,8 +183,12 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.activations}\` (
   retryable         TINYINT(1)      NOT NULL DEFAULT 1,
   gateway_response  TEXT            NULL,
   error_message     TEXT            NULL,
-  created_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  -- DATETIME, not TIMESTAMP, so these read back exactly as written - the same
+  -- storage as sent_at beside them. TIMESTAMP is held as UTC and converted on
+  -- read using whatever the session zone happens to be, which made these two
+  -- columns disagree with sent_at in the same row.
+  created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   sent_at           DATETIME        NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_activation_chrono (chrono_num),
@@ -195,8 +207,8 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.admins}\` (
   password_hash VARCHAR(255)    NOT NULL COMMENT 'scrypt$N$r$p$salt$hash',
   active        TINYINT(1)      NOT NULL DEFAULT 1,
   last_login_at DATETIME        NULL,
-  created_at    TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at    TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_admin_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -287,6 +299,7 @@ async function init() {
   await migrateSkippedStatus(database);
   await migrateWalletScoping(database);
   await migrateOfferTemplates(database);
+  await migrateTimestampsToDatetime(database);
 
   logger.info(
     `MySQL pool ready -> ${host}:${port}/${database} ` +
@@ -588,6 +601,50 @@ async function migrateOfferTemplates(database) {
         (res.affectedRows ? `, backfilled ${res.affectedRows} unnamed offer(s)` : '')
     );
   }
+}
+
+/**
+ * Converts the remaining TIMESTAMP columns to DATETIME.
+ *
+ * TIMESTAMP is stored as UTC and converted on read using the session zone;
+ * DATETIME is stored and returned exactly as written. Mixing them put
+ * created_at and sent_at in the same row on different footings - one shifting
+ * with the session, one not - so the two disagreed whenever the database and
+ * this process were on different zones.
+ *
+ * Runs on a pooled connection, which means the session zone is already pinned,
+ * so MySQL converts each stored UTC value into that zone as it rewrites the
+ * column. Get that wrong and every historic timestamp lands two hours out.
+ *
+ * Idempotent: once a column is DATETIME there is nothing left to match.
+ */
+async function migrateTimestampsToDatetime(database) {
+  const [columns] = await pool.query(
+    `SELECT TABLE_NAME, COLUMN_NAME, EXTRA
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND DATA_TYPE = 'timestamp' AND TABLE_NAME IN (?)
+      ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+    [database, Object.values(TABLES)]
+  );
+  if (!columns.length) return;
+
+  for (const col of columns) {
+    // Preserve the auto-update behaviour; without it updated_at silently stops
+    // tracking changes and every staleness check based on it goes quiet.
+    const onUpdate = String(col.EXTRA || '').toLowerCase().includes('on update')
+      ? ' ON UPDATE CURRENT_TIMESTAMP'
+      : '';
+    await pool.query(
+      `ALTER TABLE \`${col.TABLE_NAME}\`
+         MODIFY \`${col.COLUMN_NAME}\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP${onUpdate}`
+    );
+  }
+
+  logger.info(
+    `Converted ${columns.length} TIMESTAMP column(s) to DATETIME so they read back ` +
+      'exactly as written, matching sent_at: ' +
+      columns.map((c) => `${c.TABLE_NAME}.${c.COLUMN_NAME}`).join(', ')
+  );
 }
 
 function getPool() {

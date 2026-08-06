@@ -131,7 +131,10 @@ async function reportOfferHealth() {
       );
       if (info.cdrs === 0) {
         logger.error(
-          `Wallet ${offer.walletId} matches no CDRs in this window - that offer will never alert.`
+          `Wallet ${offer.walletId} matches no CDRs in this window - that offer will ` +
+            'never alert. Either the wallet id is wrong, or it has no traffic this ' +
+            `period. Fix with POST /api/offers, or take it out of the poll with ` +
+            `PATCH /api/offers/${offer.walletId}/active {"active":false}`
         );
       }
     } catch (err) {

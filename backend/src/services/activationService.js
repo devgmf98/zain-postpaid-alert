@@ -20,6 +20,12 @@ SELECT a.CHRONO_NUM_V            AS CHRONO_NUM,
        a.ATTRIBUTE1_V            AS TARIFF_CODE,
        a.ATTRIBUTE4_V            AS ATTRIBUTE4,
        b.DETAIL_DESCRIPTION_V    AS OFFER_NAME,
+       -- Fallbacks. DETAIL_DESCRIPTION_V is null for a fair number of live
+       -- tariffs (10078, 10292, 10504 among them) while these two carry the
+       -- bundle name perfectly well, so reading only the first column reported
+       -- real offers as having no name at all.
+       b.DISPLAY_DESCRIPTION_V   AS DISPLAY_NAME,
+       b.SHORT_DESC_IN_BILL_V    AS SHORT_NAME,
        a.EVENT_DATE_TIME_DT      AS EVENT_AT
   FROM CBS_CORE.CB_PREPAID_UPLOAD_ALL_EDRS a
   JOIN CBS_CORE.CB_OFFERS b
@@ -82,14 +88,23 @@ function resolveDay(now = new Date()) {
  * skips the event rather than sending a sentence with a hole in it.
  */
 function resolveOfferName(row) {
-  const candidates = [row.OFFER_NAME, row.ATTRIBUTE4];
+  // In preference order. DETAIL_DESCRIPTION_V is the column that names the
+  // bundle when it is populated; the display and billing descriptions carry the
+  // same name for the tariffs where it is not, and ATTRIBUTE4_V is the last
+  // resort because it holds a placeholder "0" far more often than a name.
+  const candidates = [row.OFFER_NAME, row.DISPLAY_NAME, row.SHORT_NAME, row.ATTRIBUTE4];
   for (const candidate of candidates) {
     const text = String(candidate ?? '').trim();
     if (!text) continue;
     if (text.toLowerCase() === 'null') continue;
     // ATTRIBUTE4_V is "0" on most rows - a placeholder, not a bundle name.
     if (/^0+$/.test(text)) continue;
-    return config.cleanOfferName(text);
+
+    // Cleaning never empties a real name, but a candidate that was only
+    // punctuation would still come back blank - fall through to the next one
+    // rather than returning something the customer would read as a gap.
+    const cleaned = config.cleanOfferName(text);
+    if (cleaned) return cleaned;
   }
   return null;
 }
@@ -112,7 +127,11 @@ async function fetchActivations(day = resolveDay()) {
       msisdn: String(row.MSISDN ?? '').trim(),
       tariffCode: String(row.TARIFF_CODE ?? '').trim(),
       attribute4: row.ATTRIBUTE4 === null ? null : String(row.ATTRIBUTE4),
-      offerRaw: row.OFFER_NAME === null ? null : String(row.OFFER_NAME),
+      // The untouched text the name was taken from, whichever column supplied
+      // it - so a stored row can be traced back to what CBS actually held.
+      offerRaw: [row.OFFER_NAME, row.DISPLAY_NAME, row.SHORT_NAME]
+        .map((v) => (v === null || v === undefined ? '' : String(v).trim()))
+        .find((v) => v && v.toLowerCase() !== 'null') || null,
       offerName: resolveOfferName(row),
       eventAt,
       dayKey: day.dayKey,

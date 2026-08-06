@@ -191,6 +191,10 @@ const config = {
     accountCode: str('ACCOUNT_CODE', ''),
     walletId: str('WALLET_ID', ''),
     offerName: str('OFFER_NAME', ''),
+    // Whether that seeded row starts active. Off by default: a fresh host's
+    // WALLET_ID is rarely the wallet anyone intended to monitor, and an offer
+    // that goes live unreviewed either alerts nobody or alerts everybody.
+    seedActive: bool('OFFER_SEED_ACTIVE', false),
     window: usageWindow,
     monthReset: monthResetMode,
     customFrom: str('CUSTOM_FROM'),
@@ -394,7 +398,13 @@ for (const level of config.thresholds.levels) {
  */
 config.renderMessage = function renderMessage(percent, offerName) {
   const pattern = config.templates[percent] || '';
-  return pattern.replace(/\{\s*(offer|offer_name|offerName)\s*\}/gi, String(offerName ?? '').trim());
+  // Cleaned the same way as an activation name, so "Postpaid Hybrid 1GB SSP"
+  // reaches the customer as "Postpaid Hybrid 1GB" whichever message carries it.
+  // The stored offer_name keeps its suffix; only the SMS drops it.
+  return pattern.replace(
+    /\{\s*(offer|offer_name|offerName)\s*\}/gi,
+    config.cleanOfferName(offerName)
+  );
 };
 
 /**
@@ -407,10 +417,25 @@ config.renderMessage = function renderMessage(percent, offerName) {
  * name, so the rule is applied as specified and the odd one is left visible.
  */
 config.cleanOfferName = function cleanOfferName(raw) {
-  return String(raw ?? '')
+  const spaced = String(raw ?? '')
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Currency suffixes are internal bookkeeping - "3 GB_USD" and
+  // "Postpaid_Hybrid-15GB_SSP" name the same thing to the customer as "3 GB"
+  // and "Postpaid Hybrid 15GB". Matched on word boundaries so a name that
+  // merely contains those letters inside a word ("USDA") is left intact.
+  const stripped = spaced
+    .replace(/\b(ssp|usd)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Only ever remove the token from a name - never remove the whole name. A
+  // bundle called just "USD" would otherwise clean to nothing and be reported
+  // as having no name at all, which is a different and much worse failure than
+  // leaving one currency code in the message.
+  return stripped || spaced;
 };
 
 /** The activation message for a bundle, with its name substituted in. */

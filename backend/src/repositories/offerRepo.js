@@ -223,7 +223,14 @@ async function seedFromEnv() {
     capGb: config.thresholds.capGb,
     threshold50Gb: config.thresholds.levels.find((l) => l.percent === 50).gb,
     threshold100Gb: config.thresholds.levels.find((l) => l.percent === 100).gb,
-    active: true,
+    // Staged inactive. WALLET_ID in .env is whatever the file happened to carry
+    // when this host was provisioned, and on a fresh deployment that is usually
+    // a leftover from somewhere else - it was 10271, a wallet with no traffic,
+    // which produced an offer that logged "will never alert" on every boot.
+    // Worse, had it been a busy wallet, a brand-new install would have started
+    // SMSing its subscribers before anyone had looked at the settings.
+    // Activate deliberately: PATCH /api/offers/:walletId/active {"active":true}
+    active: config.pool.seedActive,
   };
 
   const problems = validate(candidate);
@@ -238,8 +245,18 @@ async function seedFromEnv() {
   const { offer } = await upsert(candidate);
   logger.info(
     `${T} was empty - seeded wallet ${offer.walletId} from .env ` +
-      `(cap ${offer.capGb} GB, bars ${offer.thresholds.map((l) => `${l.percent}%@${l.gb}GB`).join(' ')})`
+      `(cap ${offer.capGb} GB, bars ${offer.thresholds.map((l) => `${l.percent}%@${l.gb}GB`).join(' ')})` +
+      (offer.active ? '' : ', INACTIVE')
   );
+  if (!offer.active) {
+    logger.warn(
+      `That seeded offer is inactive and nothing is being monitored yet. Check it ` +
+        `matches real traffic with GET /api/offers/${offer.walletId}/cdrs, then either ` +
+        `activate it (PATCH /api/offers/${offer.walletId}/active {"active":true}) or ` +
+        'POST /api/offers with the wallet you actually want. ' +
+        'Set OFFER_SEED_ACTIVE=true to have future installs seed it active.'
+    );
+  }
   return offer;
 }
 

@@ -164,6 +164,13 @@ const config = {
     database: mysqlValue('MYSQL_DATABASE', 'DB_NAME', 'automations'),
     port: Number(mysqlValue('MYSQL_PORT', 'DB_PORT', '3306')),
     connectionLimit: num('MYSQL_POOL_LIMIT', 5),
+    // Pins the session time zone so NOW() and CURRENT_TIMESTAMP match this
+    // process. Empty means "use this process's own offset", which is what keeps
+    // event times and created_at in the same row consistent without anyone
+    // having to configure the database correctly. An offset like "+02:00" is
+    // safer than a name like "Africa/Juba": the named form needs the server's
+    // time zone tables loaded, and plenty of installs never load them.
+    timeZone: str('MYSQL_TIME_ZONE'),
     // Table names cannot be bound parameters, so these are interpolated into SQL.
     // validate() enforces plain identifiers to keep that interpolation safe.
     tables: {

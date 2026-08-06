@@ -203,6 +203,25 @@ CREATE TABLE IF NOT EXISTS \`${TABLES.admins}\` (
 `;
 
 /**
+ * The offset every MySQL session is pinned to, as "+HH:MM".
+ *
+ * Defaults to this process's own offset, so the database and the application
+ * agree by construction rather than by both being configured correctly. Set
+ * MYSQL_TIME_ZONE to override - a named zone like 'Africa/Juba' works only if
+ * the server has its time zone tables loaded, which many installs do not, so an
+ * offset is the safer form.
+ */
+function sessionTimeZone() {
+  const configured = String(config.mysql.timeZone || '').trim();
+  if (configured) return configured;
+
+  const minutes = -new Date().getTimezoneOffset();
+  const sign = minutes >= 0 ? '+' : '-';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${sign}${pad(Math.floor(Math.abs(minutes) / 60))}:${pad(Math.abs(minutes) % 60)}`;
+}
+
+/**
  * Creates the database if it is missing, then opens the pool and applies schemas.
  */
 async function init() {
@@ -232,6 +251,31 @@ async function init() {
     timezone: 'local',
   });
 
+  // Pin the session time zone on every connection.
+  //
+  // mysql2's `timezone` option above only decides how JS Dates are converted on
+  // the way in and out. It has no effect on NOW() or CURRENT_TIMESTAMP, which
+  // the server evaluates in its own zone - so on a database left on UTC while
+  // this process runs Africa/Juba, created_at, updated_at and sent_at were all
+  // written two hours behind the event times sitting beside them in the same row.
+  //
+  // Setting it per session rather than asking for my.cnf to be corrected means
+  // the timestamps are right regardless of how the server is configured, and
+  // stay right if the service is pointed at a different database later.
+  const tz = sessionTimeZone();
+  pool.on('connection', (conn) => {
+    conn.query(`SET time_zone = '${tz}'`, (err) => {
+      if (err) {
+        // Worth knowing about, not worth refusing to serve over: the rows are
+        // still written, they just carry the server's idea of the time.
+        logger.warn(
+          `Could not set the MySQL session time zone to ${tz} (${err.message}). ` +
+            'NOW() and CURRENT_TIMESTAMP will use the server default.'
+        );
+      }
+    });
+  });
+
   await migrateLegacyTable(database);
   await pool.query(SCHEMA_NOTIFICATIONS);
   await pool.query(SCHEMA_STATUS);
@@ -246,7 +290,7 @@ async function init() {
 
   logger.info(
     `MySQL pool ready -> ${host}:${port}/${database} ` +
-      `(${Object.values(TABLES).join(', ')})`
+      `(${Object.values(TABLES).join(', ')}), session time zone ${tz}`
   );
   return pool;
 }

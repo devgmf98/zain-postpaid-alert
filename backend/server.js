@@ -105,6 +105,73 @@ let shuttingDown = false;
 let tookPortFromService = false;
 
 /**
+ * Warns when this process, MySQL and CBS do not agree on what time it is.
+ *
+ * This service builds wall-clock strings from Node's local time and compares
+ * them against CBS date columns, while MySQL fills created_at / sent_at from
+ * its own clock. Three clocks, and nothing forces them to match. When they
+ * drift apart the failures are quiet and nasty: the daily activation window
+ * covers the wrong 24 hours, the monthly usage window opens and closes at the
+ * wrong moment, and one row carries timestamps hours apart from each other.
+ *
+ * Diagnostic only - it never refuses to start, because a host with a skewed
+ * clock still alerts more usefully than a host that will not run.
+ */
+async function reportClockAlignment() {
+  const node = new Date();
+  const offsetHours = -node.getTimezoneOffset() / 60;
+  const sign = offsetHours >= 0 ? '+' : '';
+  logger.info(
+    `Clock: this process is UTC${sign}${offsetHours} ` +
+      `(TZ=${process.env.TZ || 'inherited from the host'}), local time ${node.toISOString()}`
+  );
+
+  try {
+    const rows = await mysqlDb.query(
+      'SELECT NOW() AS DB_NOW, @@system_time_zone AS DB_TZ, @@session.time_zone AS SESSION_TZ'
+    );
+    const dbNow = new Date(rows[0].DB_NOW);
+    const skewMin = Math.round((dbNow.getTime() - node.getTime()) / 60000);
+    logger.info(`Clock: MySQL is ${rows[0].DB_TZ} (session ${rows[0].SESSION_TZ}), NOW() = ${rows[0].DB_NOW}`);
+    if (Math.abs(skewMin) >= 2) {
+      logger.error(
+        `Clock: MySQL is ${skewMin} minute(s) away from this process. Rows will carry ` +
+          'event times and created_at values that disagree by that much. Put both on the ' +
+          'same zone - for South Sudan that is Africa/Juba.'
+      );
+    }
+  } catch (err) {
+    logger.warn(`Clock: could not read the MySQL time (${err.message.split('\n')[0]})`);
+  }
+
+  try {
+    const rows = await oracle.query(
+      "SELECT TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') AS CBS_NOW FROM DUAL",
+      {}
+    );
+    const cbs = rows[0].CBS_NOW;
+    // CBS returns wall-clock text with no zone, which is exactly how this
+    // service reads the CDR and EDR date columns - so comparing it against our
+    // own wall clock is the comparison that actually matters.
+    const pad = (n) => String(n).padStart(2, '0');
+    const mine =
+      `${node.getFullYear()}-${pad(node.getMonth() + 1)}-${pad(node.getDate())} ` +
+      `${pad(node.getHours())}:${pad(node.getMinutes())}:${pad(node.getSeconds())}`;
+    const skewMin = Math.round((new Date(cbs.replace(' ', 'T')) - new Date(mine.replace(' ', 'T'))) / 60000);
+    logger.info(`Clock: CBS SYSDATE = ${cbs}, this process reads ${mine}`);
+    if (Math.abs(skewMin) >= 2) {
+      logger.error(
+        `Clock: CBS wall-clock is ${skewMin} minute(s) away from this process. Every ` +
+          'window is built from our clock and matched against CBS date columns, so the ' +
+          "daily and monthly windows are covering the wrong period by that much."
+      );
+    }
+  } catch (err) {
+    logger.warn(`Clock: could not read the CBS time (${err.message.split('\n')[0]})`);
+  }
+}
+
+/**
  * Says plainly whether each active offer's wallet matches any CDRs. A wallet
  * with no traffic otherwise yields a monitor that reports itself perfectly
  * healthy while watching nothing at all.
@@ -348,6 +415,10 @@ async function bootstrap() {
   // before binding meant a slow database left a process that was running,
   // logging nothing after "Oracle connectivity verified", never listening and
   // never polling - alive, and doing nothing at all.
+  reportClockAlignment().catch((err) => {
+    logger.warn(`Clock check did not finish: ${logger.describe(err).split('\n')[0]}`);
+  });
+
   reportOfferHealth().catch((err) => {
     logger.warn(`Offer check did not finish: ${logger.describe(err).split('\n')[0]}`);
   });

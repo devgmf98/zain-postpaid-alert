@@ -291,7 +291,6 @@ const config = {
     // held back. Only useful if a burst of completed rounds would otherwise
     // deliver several SMS at once.
     minGapMs: num('SMS_MIN_GAP_MS', 0),
-    maxLength: num('SMS_MAX_LENGTH', 160),
     apiKey: str('FLOODWAVE_API_KEY'),
     // Header the API key is sent in.
     authHeader: str('FLOODWAVE_AUTH_HEADER', 'X-API-Key'),
@@ -308,6 +307,15 @@ const config = {
     // transient one, so a too-long template silently loses every alert it
     // touches. Checked before an offer is saved and again before each send.
     maxLength: num('SMS_MAX_LENGTH', 160),
+    // Words taken out of a bundle name before it reaches the customer -
+    // currency codes and internal jargon that mean nothing to them. Comma
+    // separated, matched whole-word and case-insensitively, so a rule removing
+    // "USD" leaves "USDA" alone. In .env because this list keeps growing: it
+    // began as SSP and USD, then gained Quota.
+    offerNameStrip: str('SMS_OFFER_NAME_STRIP', 'SSP,USD,Quota')
+      .split(',')
+      .map((word) => word.trim())
+      .filter(Boolean),
   },
 
   // Bundle-activation notices, driven by the EDR feed rather than by usage.
@@ -416,20 +424,37 @@ config.renderMessage = function renderMessage(percent, offerName) {
  * comes out as "1 5GB". Substituting "." instead would be wrong for every other
  * name, so the rule is applied as specified and the odd one is left visible.
  */
+/**
+ * One whole-word alternation built from SMS_OFFER_NAME_STRIP.
+ *
+ * Each word is escaped before going into the pattern - the list is operator
+ * input, and an unescaped "." or "+" in it would quietly match far more than
+ * intended. Compiled once rather than per name, since this runs for every
+ * subscriber on every cycle.
+ */
+const STRIP_WORDS = config.sms.offerNameStrip.length
+  ? new RegExp(
+      `\\b(${config.sms.offerNameStrip
+        .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('|')})\\b`,
+      'gi'
+    )
+  : // Matches nothing, so an empty list leaves names untouched rather than
+    // producing a pattern that matches everywhere.
+    /(?!)/g;
+
 config.cleanOfferName = function cleanOfferName(raw) {
   const spaced = String(raw ?? '')
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Currency suffixes are internal bookkeeping - "3 GB_USD" and
-  // "Postpaid_Hybrid-15GB_SSP" name the same thing to the customer as "3 GB"
-  // and "Postpaid Hybrid 15GB". Matched on word boundaries so a name that
-  // merely contains those letters inside a word ("USDA") is left intact.
-  const stripped = spaced
-    .replace(/\b(ssp|usd)\b/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  // Currency codes and internal jargon are bookkeeping - "3 GB_USD",
+  // "Postpaid_Hybrid-15GB_SSP" and "Daily_Quota_1GB" name the same things to
+  // the customer as "3 GB", "Postpaid Hybrid 15GB" and "Daily 1GB". Matched on
+  // word boundaries so a name merely containing those letters ("USDA") is left
+  // intact. The word list comes from SMS_OFFER_NAME_STRIP.
+  const stripped = spaced.replace(STRIP_WORDS, ' ').replace(/\s+/g, ' ').trim();
 
   // Only ever remove the token from a name - never remove the whole name. A
   // bundle called just "USD" would otherwise clean to nothing and be reported

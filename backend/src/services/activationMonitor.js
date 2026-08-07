@@ -30,6 +30,8 @@ const stats = {
   eventsSeen: 0,
   queued: 0,
   skippedBacklog: 0,
+  // Recorded while ACTIVATION_SMS_ENABLED was false.
+  heldNotSent: 0,
   unnamed: 0,
   lastActivationAt: null,
 };
@@ -40,6 +42,10 @@ let cycleInFlight = false;
 // The day the last cycle covered, so the rollover is visible in the log rather
 // than being an invisible change in what the query returns.
 let lastDayKey = null;
+// When this process began watching. Only consulted under
+// ACTIVATION_WATCH_FROM=START; under MIDNIGHT the cutoff is the day boundary,
+// so a restart does not narrow what counts as current.
+let watchingSince = new Date();
 
 /**
  * One pass over today's activation EDRs.
@@ -66,11 +72,22 @@ async function runCycle() {
 
   stats.eventsSeen = events.length;
 
-  // On the first run of a day the whole backlog since midnight looks new.
-  // Announcing it would tell someone at 18:00 that their 07:00 bundle has just
-  // been activated, and would do it for every subscriber at once.
-  const firstRunOfDay = dayState.size === 0;
-  const announceBacklog = config.activation.announceBacklog;
+  // The instant an activation must fall on or after to be announced.
+  //
+  // This used to be "is the table empty for today?", which was wrong in a way
+  // that only showed up on a quiet day: the table is empty every midnight and
+  // on any day with no activations yet, so the first genuine activation of the
+  // day was recorded as stale backlog no matter when it happened. An event at
+  // 08:13 was skipped as "already activated before this run started" while the
+  // service had been watching all along.
+  //
+  // Comparing the event's own time against a fixed cutoff has no such edge:
+  // midnight rollover changes the cutoff to the new midnight, and events after
+  // it are announced normally.
+  const cutoff = config.activation.watchFrom === 'START' ? watchingSince : day.from;
+  const sendingHeld = !config.activation.smsEnabled;
+  let skippedThisCycle = 0;
+  let heldThisCycle = 0;
 
   for (const event of events) {
     if (!event.chronoNum || !event.msisdn) continue;
@@ -95,24 +112,45 @@ async function runCycle() {
     }
 
     const message = config.renderActivation(event.offerName);
-    const backlog = firstRunOfDay && !announceBacklog;
+    // Older than the cutoff: it happened before this service was watching, so
+    // announcing it now would tell someone their morning bundle has just been
+    // activated. Recorded rather than sent, so the decision is auditable.
+    const backlog = event.eventAt < cutoff;
+    // ACTIVATION_SMS_ENABLED=false holds sending without stopping the record,
+    // so the table still shows exactly what the feed produced.
+    const held = sendingHeld && !backlog;
+    const closed = backlog || held;
 
     const slotId = await activationRepo.claim({
       ...event,
       dayKey: day.dayKey,
       message,
-      status: backlog ? 'SKIPPED' : 'PENDING',
+      status: closed ? 'SKIPPED' : 'PENDING',
       errorMessage: backlog
-        ? 'already activated before this run started - announcing it now would be stale'
-        : null,
+        ? `activated at ${event.eventAt.toISOString()}, before this run began ` +
+          `watching at ${cutoff.toISOString()} - announcing it now would be stale`
+        : held
+          ? 'recorded but not sent - ACTIVATION_SMS_ENABLED is false'
+          : null,
     });
     // Another cycle owns it; nothing to do.
     if (!slotId) continue;
 
-    dayState.set(event.chronoNum, { status: backlog ? 'SKIPPED' : 'PENDING' });
+    dayState.set(event.chronoNum, { status: closed ? 'SKIPPED' : 'PENDING' });
 
     if (backlog) {
       stats.skippedBacklog += 1;
+      skippedThisCycle += 1;
+      continue;
+    }
+    if (held) {
+      stats.heldNotSent += 1;
+      heldThisCycle += 1;
+      logger.info(
+        `Activation held: ${event.msisdn} subscribed to "${event.offerName}" ` +
+          `at ${event.eventAt.toISOString()} - recorded, no SMS ` +
+          '(ACTIVATION_SMS_ENABLED=false)'
+      );
       continue;
     }
 
@@ -132,10 +170,19 @@ async function runCycle() {
     stats.lastActivationAt = new Date().toISOString();
   }
 
-  if (firstRunOfDay && !announceBacklog && stats.skippedBacklog > 0) {
+  if (heldThisCycle > 0) {
     logger.warn(
-      `${stats.skippedBacklog} activation(s) from earlier today were recorded as SKIPPED ` +
-        'rather than announced. Set ACTIVATION_ANNOUNCE_BACKLOG=true to send them instead.'
+      `${heldThisCycle} activation(s) recorded without sending - ACTIVATION_SMS_ENABLED ` +
+        'is false. Set it true to start sending; these are closed and will not be ' +
+        'sent retrospectively.'
+    );
+  }
+
+  if (skippedThisCycle > 0) {
+    logger.warn(
+      `${skippedThisCycle} activation(s) predating ${cutoff.toISOString()} were recorded ` +
+        'as SKIPPED rather than announced. ACTIVATION_WATCH_FROM=MIDNIGHT covers the ' +
+        'whole of today; START covers only what happened after this process began.'
     );
   }
 
@@ -190,13 +237,17 @@ function start() {
 
   stopped = false;
   stats.running = true;
-  stats.startedAt = new Date().toISOString();
+  watchingSince = new Date();
+  stats.startedAt = watchingSince.toISOString();
 
   const day = activationService.resolveDay();
   logger.info(
     `Activation monitor started - EDRs for ${day.dayKey}, every ` +
       `${config.activation.intervalMs} ms, dryRun=${config.monitor.dryRun}, ` +
-      `announceBacklog=${config.activation.announceBacklog}`
+      `smsEnabled=${config.activation.smsEnabled}, ` +
+      `announcing activations from ${config.activation.watchFrom === 'START'
+        ? watchingSince.toISOString() + ' (this process start)'
+        : day.from.toISOString() + ' (midnight)'}`
   );
   tick();
   return { started: true };
@@ -219,7 +270,9 @@ function getStatus() {
     ...stats,
     enabled: config.activation.enabled,
     intervalMs: config.activation.intervalMs,
-    announceBacklog: config.activation.announceBacklog,
+    smsEnabled: config.activation.smsEnabled,
+    watchFrom: config.activation.watchFrom,
+    watchingSince: watchingSince.toISOString(),
     cycleInFlight,
     table: config.mysql.tables.activations,
   };

@@ -328,6 +328,18 @@ const config = {
   // Bundle-activation notices, driven by the EDR feed rather than by usage.
   activation: {
     enabled: bool('ACTIVATION_ENABLED', true),
+    // The send switch, separate from `enabled` above.
+    //   enabled=false     - the poller does not run at all; nothing is read or
+    //                       recorded, and the day passes unobserved.
+    //   smsEnabled=false  - the poller keeps running and keeps recording every
+    //                       activation, it just sends nothing. Use this to
+    //                       watch what the feed produces before letting it
+    //                       message anyone, or to hold sending during an
+    //                       incident without losing the record of what happened.
+    // Activations recorded while this is false are closed as SKIPPED, not held
+    // in a queue: switching it back on sends what happens next, never a backlog
+    // of notices telling people their bundle was activated hours ago.
+    smsEnabled: bool('ACTIVATION_SMS_ENABLED', true),
     // Polled on its own timer, not inside the usage cycle: the two queries hit
     // different CBS tables and one being slow must not delay the other.
     intervalMs: num('ACTIVATION_POLL_INTERVAL_MS', 1000),
@@ -336,12 +348,24 @@ const config = {
     // is what says whether a subscription is HYBRID. Leaving this empty would
     // announce every subscription on the platform, so it is required.
     subServiceCode: str('ACTIVATION_SUB_SERVICE_CODE', 'HYBRID'),
-    // A restart re-reads the whole of today. Events already recorded are skipped
-    // by the unique key, but on the very first run of a day every activation
-    // since midnight is new - and telling someone at 18:00 that their morning
-    // bundle "has been activated" is both wrong and a burst of SMS. Off by
-    // default: that backlog is recorded as SKIPPED instead of sent.
-    announceBacklog: bool('ACTIVATION_ANNOUNCE_BACKLOG', false),
+    // How far back an activation may be and still be announced.
+    //   MIDNIGHT - everything from 00:00 today. The day is the unit of work, so
+    //              an activation at 00:05 is announced whether the service
+    //              started at 23:00 yesterday or 00:04 today.
+    //   START    - only activations at or after this process began watching.
+    //              Use when a long outage must not produce a burst of late
+    //              notices; anything missed while it was down stays unsent.
+    // Either way the chrono_num key means an activation already recorded is
+    // never announced twice, so a restart replays nothing.
+    watchFrom: (() => {
+      // ACTIVATION_ANNOUNCE_BACKLOG=true meant the same thing as MIDNIGHT.
+      if (bool('ACTIVATION_ANNOUNCE_BACKLOG', false)) return 'MIDNIGHT';
+      const mode = str('ACTIVATION_WATCH_FROM', 'MIDNIGHT').toUpperCase();
+      if (!['MIDNIGHT', 'START'].includes(mode)) {
+        throw new Error(`ACTIVATION_WATCH_FROM must be MIDNIGHT or START, got "${mode}"`);
+      }
+      return mode;
+    })(),
   },
 
   auth: {

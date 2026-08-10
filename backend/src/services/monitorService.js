@@ -312,9 +312,35 @@ async function closePassedThresholds(offer, usageRows, alreadySeen, window, peri
  * One poll for one offer: read that wallet's usage from Oracle, compare against
  * the offer's own thresholds and send whatever has not already been sent.
  */
-async function runOfferCycle(offer, window) {
+/**
+ * The window this offer is measured over.
+ *
+ * Under MONTH/DAY/CUSTOM every offer shares one span, so the shared window is
+ * used as-is. Under CONTINUOUS the span reaches back to CONTINUOUS_FROM, which
+ * may predate the offer entirely - an offer added in September would otherwise
+ * sum August's CDRs for that wallet and inherit usage that was never part of
+ * it, quite possibly firing a cap alert on its first cycle.
+ *
+ * So each offer starts counting from its own row instead, and only reaches
+ * further back if CONTINUOUS_FROM is later. Offers that run past a month end
+ * keep accumulating across it either way; that is the point of the mode.
+ */
+function windowForOffer(offer, window) {
+  if (window.periodKey !== config.CONTINUOUS_PERIOD) return window;
+
+  const offerStart = offer.createdAt ? new Date(offer.createdAt) : null;
+  if (!offerStart || Number.isNaN(offerStart.getTime())) return window;
+  if (offerStart <= window.from) return window;
+
+  return { ...window, from: offerStart };
+}
+
+async function runOfferCycle(offer, sharedWindow) {
   const startedAt = Date.now();
   const mine = statsFor(offer.walletId);
+  // Each offer accumulates from its own start under CONTINUOUS; identical to
+  // the shared window in every other mode.
+  const window = windowForOffer(offer, sharedWindow);
 
   // The cap is consumed in rounds. A subscriber already alerted at the top
   // threshold restarts counting from that point, so each can be measured over a

@@ -300,7 +300,6 @@ async function init() {
   await migrateWalletScoping(database);
   await migrateOfferTemplates(database);
   await migrateTimestampsToDatetime(database);
-  await migrateToContinuousPeriod();
 
   logger.info(
     `MySQL pool ready -> ${host}:${port}/${database} ` +
@@ -646,73 +645,6 @@ async function migrateTimestampsToDatetime(database) {
       'exactly as written, matching sent_at: ' +
       columns.map((c) => `${c.TABLE_NAME}.${c.COLUMN_NAME}`).join(', ')
   );
-}
-
-/**
- * Folds per-month history into the single CONTINUOUS period.
- *
- * Only runs under USAGE_WINDOW=CONTINUOUS. Without it the switch is silently
- * destructive: every lookup would use period_ym 'ALLTIME', the existing rows
- * would still say '2026-08', so every subscriber would read as never-seen and
- * first-sight handling would fire a cap-crossing alert for the whole pool at
- * once.
- *
- * Rounds are renumbered rather than merged. Two months each holding a round 1
- * would collide on the unique key, and what the round logic actually reads is
- * how many top-threshold alerts a subscriber has had - so numbering them 1..n
- * in the order they happened preserves the count and keeps the key intact.
- *
- * One-way: switching back to MONTH afterwards leaves nothing under the old
- * monthly keys, which is the same burst in reverse.
- */
-async function migrateToContinuousPeriod() {
-  if (config.pool.window !== 'CONTINUOUS') return;
-  const period = config.CONTINUOUS_PERIOD;
-
-  const [[stale]] = await pool.query(
-    `SELECT COUNT(*) AS n FROM \`${TABLES.notifications}\` WHERE period_ym <> ?`,
-    [period]
-  );
-  if (!Number(stale.n)) return;
-
-  logger.warn(
-    `USAGE_WINDOW=CONTINUOUS: folding ${stale.n} alert row(s) from monthly periods ` +
-      `into "${period}" and renumbering rounds. Without this every subscriber would ` +
-      'read as never-seen and be alerted again.'
-  );
-
-  await pool.query(
-    `UPDATE \`${TABLES.notifications}\` n
-       JOIN (
-         SELECT id,
-                ROW_NUMBER() OVER (
-                  PARTITION BY wallet_id, msisdn, threshold_percent
-                  ORDER BY created_at, id
-                ) AS rn
-           FROM \`${TABLES.notifications}\`
-       ) seq ON seq.id = n.id
-        SET n.period_ym = ?, n.round_no = seq.rn`,
-    [period]
-  );
-
-  // The usage table is a mirror the poller rebuilds, so collapsing it loses
-  // nothing that is not re-derived on the next cycle. Keep the most recent row
-  // per subscriber: one period now means one row each, and the older monthly
-  // rows would collide on the unique key.
-  await pool.query(
-    `DELETE older FROM \`${TABLES.usage}\` older
-       JOIN \`${TABLES.usage}\` newer
-         ON newer.wallet_id = older.wallet_id
-        AND newer.msisdn = older.msisdn
-        AND (newer.updated_at > older.updated_at
-             OR (newer.updated_at = older.updated_at AND newer.id > older.id))`
-  );
-  await pool.query(
-    `UPDATE \`${TABLES.usage}\` SET period_ym = ? WHERE period_ym <> ?`,
-    [period, period]
-  );
-
-  logger.info(`Alert history folded into the "${period}" period - rounds continue unbroken`);
 }
 
 function getPool() {

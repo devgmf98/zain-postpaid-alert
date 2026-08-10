@@ -108,19 +108,9 @@ function parseDateTime(value, label) {
 }
 
 const usageWindow = str('USAGE_WINDOW', 'MONTH').toUpperCase();
-if (!['MONTH', 'DAY', 'CUSTOM', 'CONTINUOUS'].includes(usageWindow)) {
-  throw new Error(
-    `USAGE_WINDOW must be MONTH, DAY, CUSTOM or CONTINUOUS, got "${usageWindow}"`
-  );
+if (!['MONTH', 'DAY', 'CUSTOM'].includes(usageWindow)) {
+  throw new Error(`USAGE_WINDOW must be MONTH, DAY or CUSTOM, got "${usageWindow}"`);
 }
-
-// The period key CONTINUOUS uses in place of "YYYY-MM".
-//
-// period_ym is CHAR(7) and part of the de-duplication key, so the constant has
-// to be seven characters. Every row shares it, which is the whole point: with
-// one key there is no month boundary for eligibility to reset across, and a
-// subscriber's rounds carry on from wherever they had reached.
-const CONTINUOUS_PERIOD = 'ALLTIME';
 
 // Where the monthly counter rolls over to zero.
 //   LAST_DAY  - 00:00 on the last day of the month (31 Jul 00:00, 28 Feb 00:00, ...)
@@ -216,11 +206,6 @@ const config = {
     monthReset: monthResetMode,
     customFrom: str('CUSTOM_FROM'),
     customTo: str('CUSTOM_TO'),
-    // Where CONTINUOUS starts counting from. Everything since this instant is
-    // one unbroken period, so it is also the point rounds are measured from.
-    // Set it once and leave it: moving it later re-bases every subscriber's
-    // total, which changes which round they are on.
-    continuousFrom: str('CONTINUOUS_FROM'),
   },
 
   thresholds: {
@@ -428,7 +413,6 @@ const config = {
   },
 
   GB,
-  CONTINUOUS_PERIOD,
 };
 
 // Attach the byte value for each threshold so comparisons never touch floats.
@@ -550,20 +534,6 @@ config.resolveWindow = function resolveWindow(now = new Date()) {
   const pad = (n) => String(n).padStart(2, '0');
   const ym = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 
-  // No reset at all: usage accumulates from a fixed start date and the rounds
-  // simply keep going. A subscriber on round 3 at the end of a month is still
-  // on round 3 the next morning, and their next alert is round 4 - rather than
-  // the counter dropping to zero and every bar becoming eligible again.
-  //
-  // The window still has an upper bound so the query stays a range scan; it is
-  // set a day ahead rather than left open so a CDR timestamped slightly in the
-  // future is still counted.
-  if (config.pool.window === 'CONTINUOUS') {
-    const from = parseDateTime(config.pool.continuousFrom, 'CONTINUOUS_FROM');
-    const to = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-    return { from, to, periodKey: CONTINUOUS_PERIOD };
-  }
-
   if (config.pool.window === 'MONTH' && config.pool.monthReset === 'LAST_DAY') {
     // Cycle boundaries sit at 00:00 on the last day of each month. The period is
     // named after the month its closing boundary falls in, so the cycle that
@@ -682,18 +652,12 @@ config.validate = function validate() {
       );
     }
   }
-  if (config.pool.window === 'CUSTOM' || config.pool.window === 'CONTINUOUS') {
+  if (config.pool.window === 'CUSTOM') {
     try {
       config.resolveWindow();
     } catch (err) {
       problems.push(err.message);
     }
-  }
-  if (config.pool.window === 'CONTINUOUS' && !config.pool.continuousFrom) {
-    problems.push(
-      'CONTINUOUS_FROM is required when USAGE_WINDOW=CONTINUOUS - it is the date ' +
-        'usage and rounds are counted from, and there is no sensible default'
-    );
   }
 
   if (problems.length) {
